@@ -18,7 +18,10 @@ package enforce
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,9 +77,12 @@ func EnforceAll(ctx context.Context, ghc ghclients.GhClientsInterface, specificP
 	if err != nil {
 		return nil, err
 	}
-	insts, err := getAppInstallations(ctx, ac)
-	if err != nil {
-		return nil, err
+	insts := []*github.Installation{nil}
+	if specificRepoArg == "" {
+		insts, err = getAppInstallations(ctx, ac)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	log.Info().
@@ -89,7 +95,7 @@ func EnforceAll(ctx context.Context, ghc ghclients.GhClientsInterface, specificP
 	var mu sync.Mutex
 
 	for _, i := range insts {
-		if i.SuspendedAt != nil {
+		if specificRepoArg == "" && i.SuspendedAt != nil {
 			log.Info().
 				Str("area", "bot").
 				Int64("instId", i.GetID()).
@@ -110,17 +116,14 @@ func EnforceAll(ctx context.Context, ghc ghclients.GhClientsInterface, specificP
 
 		g.Go(func() error {
 
-			repos, _, err := getAppInstallationRepos(ctx, ic)
-
+			var repos []*github.Repository
 			if specificRepoArg != "" {
-				var found github.Repository
-				for _, r := range repos {
-					if *r.FullName == specificRepoArg {
-						found = *r
-					}
-				}
-				repos = []*github.Repository{}
-				repos = append(repos, &found)
+				ownerRepo := strings.SplitN(specificRepoArg, "/", 2)
+				var r *github.Repository
+				r, _, err = ic.Repositories.Get(ctx, ownerRepo[0], ownerRepo[1])
+				repos = []*github.Repository{r}
+			} else {
+				repos, _, err = getAppInstallationRepos(ctx, ic)
 			}
 
 			// FIXME, not getting a rsp for this one, instead I think it is a special
@@ -204,8 +207,74 @@ func runPoliciesOnInstRepos(ctx context.Context, repos []*github.Repository, ghc
 			}
 		}
 	}
+	results, err := os.Create("results.sarif")
+	if err != nil {
+		return instResults, err
+	}
+	enc := json.NewEncoder(results)
+	enc.Encode(sarifLog{
+		Version: "2.1.0",
+		Runs: []run{{
+			Tool: tool{
+				Driver: toolComponent{
+					Name: "Tool Name",
+				},
+			},
+			Results: []result{{
+				Message: message{
+					Text: "Result text. This result does not have a rule associated.",
+				},
+				Locations: []location{{
+					PhysicalLocation: physicalLocation{
+						ArtifactLocation: artifactLocation{
+							URI: "no file associated with this alert",
+						},
+					},
+				}},
+			}},
+		}},
+	})
 	config.ClearInstLoc(owner)
 	return instResults, repoLoopErr
+}
+
+type sarifLog struct {
+	Version string `json:"version"`
+	Runs    []run  `json:"runs"`
+}
+
+type run struct {
+	Tool    tool     `json:"tool"`
+	Results []result `json:"results"`
+}
+
+type tool struct {
+	Driver toolComponent `json:"driver"`
+}
+
+type toolComponent struct {
+	Name string `json:"name"`
+}
+
+type result struct {
+	Message   message    `json:"message"`
+	Locations []location `json:"locations"`
+}
+
+type message struct {
+	Text string `json:"text"`
+}
+
+type location struct {
+	PhysicalLocation physicalLocation `json:"physicalLocation"`
+}
+
+type physicalLocation struct {
+	ArtifactLocation artifactLocation `json:"artifactLocation"`
+}
+
+type artifactLocation struct {
+	URI string `json:"uri"`
 }
 
 func listInstallationsReal(ctx context.Context, ac *github.Client) ([]*github.Installation, error) {
